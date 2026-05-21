@@ -1,19 +1,52 @@
-# Aurora PostgreSQL User Audit Monitoring
+# Aurora PostgreSQL User Audit Monitor
 
-> Detect and alert on individual user DML activity (SELECT, INSERT, UPDATE, DELETE) on Aurora PostgreSQL clusters using pgAudit, Lambda, CloudWatch, and SNS.
+Detect and alert on individual user DML activity on Aurora PostgreSQL clusters using pgAudit, Lambda, CloudWatch, and SNS.
+
+**Audit scope:** Individual human users making direct DML changes (SELECT, INSERT, UPDATE, DELETE) on application tables. Application service accounts are deliberately excluded — their DML is expected. The risk surface is direct human access: a developer connected via psql, a support engineer running an ad-hoc update, a credential that should never have had direct database access.
 
 ---
 
-## What This Does
+## Repository Structure
 
-In regulated environments, the audit question isn't whether to log — it's *who* to log. Application service accounts are expected to read and write data. The risk surface is **direct human access**: a developer connected via psql, a support engineer running an ad-hoc update, a credential that should never have had direct database access.
-
-This solution:
-- Enables pgAudit logging scoped to individual human user accounts
-- Filters system and tool noise (DBeaver, JDBC driver init, pg_catalog queries) from the raw CloudWatch log stream
-- Bridges CloudWatch Log Insights to CloudWatch Alarms via Lambda (they cannot connect natively)
-- Alerts through your incident management platform and email on every detection window where user DML is found
-- Provides timestamped Lambda execution logs as an independent, durable record of detection — useful for compliance reviews
+```
+├── README.md
+├── deploy-all.sh                        # Full CLI deployment sequence (single account)
+│
+├── lambda/
+│   ├── lambda_function.py               # Core audit monitor — Log Insights query, metric publish
+│   └── deploy-lambda.sh                 # Package and deploy / update Lambda
+│
+├── iam/
+│   ├── lambda-trust-policy.json         # Lambda execution role trust policy
+│   ├── lambda-permissions-policy.json   # Least-privilege: Log Insights read + CW metric write
+│   └── deploy-iam.sh                    # Create role and attach inline policy
+│
+├── eventbridge/
+│   └── deploy-eventbridge.sh            # 5-minute schedule rule + Lambda target + invoke permission
+│
+├── sns/
+│   ├── topic-policy.json                # Resource policy: AllowCW + DenyHTTP + LimitToAccount
+│   ├── kms-key-policy.json              # Customer-managed key with CloudWatch service grant
+│   └── deploy-sns.sh                    # Create topic, KMS key, apply policies, add subscriptions
+│
+├── cloudwatch/
+│   ├── log-insights-query.txt           # Standalone filter query for manual console use
+│   ├── deploy-alarm.sh                  # CloudWatch alarm on UserDMLOperationCount metric
+│   ├── deploy-dashboard.sh              # Two-widget dashboard: live audit table + alarm status
+│   └── set-log-retention.sh             # Set log retention policy (default 365 days)
+│
+├── sql/
+│   └── pgaudit-setup.sql                # pgAudit install, per-user enable, verification queries
+│
+└── terraform/                           # Full IaC module — deploys the complete stack
+    ├── main.tf                          # Providers, data sources, locals
+    ├── variables.tf                     # All inputs with descriptions and defaults
+    ├── lambda.tf                        # Lambda function + IAM role + EventBridge rule
+    ├── sns.tf                           # KMS key + SNS topic + resource policy + subscriptions
+    ├── cloudwatch.tf                    # Alarm + dashboard + log retention
+    ├── outputs.tf                       # ARNs and URLs for all created resources
+    └── terraform.tfvars.example         # Copy to terraform.tfvars and fill in before deploying
+```
 
 ---
 
@@ -21,20 +54,20 @@ This solution:
 
 ```
 Aurora PostgreSQL  (pgAudit per-user logging)
-        │
+        │  pgAudit → PostgreSQL log stream
         ▼
 CloudWatch Logs   /aws/rds/cluster/<cluster>/postgresql
         │
-        ├──► CloudWatch Dashboard  (real-time Log Insights view)
+        ├──► CloudWatch Dashboard  (real-time Log Insights table view)
         │
 EventBridge  rate(5 minutes)
         │
         ▼
-Lambda Function
-  ├── Runs Log Insights query (last 5 min window)
-  ├── Filters system/tool noise
+lambda/lambda_function.py
+  ├── Runs AUDIT_FILTER_QUERY against last 5-minute window
+  ├── Excludes system catalog queries and tool noise
   ├── Counts user DML: SELECT / INSERT / UPDATE / DELETE
-  └── Publishes metric → RDSAudit/UserActivity namespace
+  └── Publishes UserDMLOperationCount → RDSAudit/UserActivity
         │
         ▼
 CloudWatch Custom Metric  UserDMLOperationCount
@@ -48,199 +81,160 @@ SNS Topic  rds-user-audit-alerts
   └── Email → engineering team
 ```
 
----
+**Why Lambda between Log Insights and the alarm:**
+CloudWatch Alarms cannot evaluate Log Insights query results directly — there is no native integration. Lambda bridges the gap: it runs the query, extracts the count, and publishes it as a standard CloudWatch metric the alarm can evaluate.
 
-## Repository Structure
-
-```
-├── README.md
-├── lambda/
-│   └── lambda_function.py          # Core audit monitor Lambda
-├── iam/
-│   ├── lambda-trust-policy.json    # Lambda execution role trust policy
-│   └── lambda-permissions.md       # Required IAM permissions reference
-├── sns/
-│   ├── topic-policy.json           # SNS resource policy (HTTPS enforcement, account lock-down)
-│   └── kms-key-policy.json         # Customer-managed KMS key policy with CloudWatch grant
-├── cloudwatch/
-│   ├── alarm.sh                    # CloudWatch alarm creation script
-│   ├── dashboard.json              # CloudWatch dashboard definition
-│   └── log-insights-query.txt      # Standalone filter query for manual use
-├── eventbridge/
-│   └── schedule.sh                 # EventBridge rule and target setup
-├── terraform/                      # (coming) Full Terraform module
-│   └── README.md
-└── docs/
-    ├── pgaudit-setup.md            # pgAudit enablement steps
-    ├── sns-security.md             # SNS HTTPS + KMS configuration detail
-    ├── kms-gotcha.md               # alias/aws/sns + CloudWatch Alarms issue explained
-    ├── deduplication.md            # Incident platform deduplication behavior and fixes
-    └── alert-runbook.md            # What to do when an alert fires
-```
+Lambda execution logs also provide a timestamped, independent record of every detection event — separate from and corroborating the raw pgAudit stream. Relevant when compliance asks "when was this first detected and by what mechanism?"
 
 ---
 
 ## Prerequisites
 
-- Aurora PostgreSQL cluster with parameter group access
-- AWS CLI configured with appropriate permissions
-- Python 3.9+ (Lambda runtime)
-- Incident management platform with HTTPS webhook support (Opsgenie, PagerDuty, VictorOps, etc.)
-
-### Required IAM permissions for Lambda execution role
-
-```
-# Read permissions
-logs:StartQuery
-logs:GetQueryResults
-logs:DescribeLogGroups
-
-# Write permissions  
-cloudwatch:PutMetricData
-
-# Basic Lambda execution
-logs:CreateLogGroup
-logs:CreateLogStream
-logs:PutLogEvents
-```
-
-> Full IAM role setup: see `iam/lambda-permissions.md`
+- Aurora PostgreSQL cluster with parameter group edit access
+- AWS CLI configured (`AWS_PROFILE`, `AWS_REGION`)
+- Python 3.9 (Lambda runtime)
+- Incident management platform with HTTPS webhook support
 
 ---
 
-## Quick Start
+## Option 1: Terraform (recommended for multiple accounts)
 
-### Step 1: Enable pgAudit on the Aurora cluster
+```bash
+cd terraform/
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your values
 
-Add `pgaudit` to `shared_preload_libraries` in the cluster parameter group. **Requires cluster reboot.**
+terraform init
+terraform plan
+terraform apply
+```
 
-Then in the database:
+**Required variables** (see `terraform/variables.tf` for full list and defaults):
 
+| Variable | Description |
+|---|---|
+| `cluster_name` | Aurora cluster name — used to derive the log group path |
+| `environment` | Deployment label: dev, staging, production |
+| `alert_email` | Email for audit notifications |
+| `incident_platform_url` | HTTPS webhook URL (Opsgenie, PagerDuty, VictorOps, etc.) |
+| `log_retention_days` | CloudWatch retention window (default: 365) |
+
+Terraform outputs the Lambda ARN, SNS topic ARN, KMS key ID, alarm name, and dashboard URL.
+
+---
+
+## Option 2: CLI scripts (single account / first-time)
+
+Set environment variables, then run `deploy-all.sh`:
+
+```bash
+export AWS_PROFILE=your-aws-profile
+export AWS_REGION=us-east-1
+export ACCOUNT_ID=123456789012
+export CLUSTER_NAME=your-aurora-cluster
+export ALERT_EMAIL=engineering-team@your-company.com
+export INCIDENT_PLATFORM_URL=https://your-platform/endpoint?apiKey=YOUR_KEY
+export RETENTION_DAYS=365
+
+chmod +x deploy-all.sh
+./deploy-all.sh
+```
+
+`deploy-all.sh` runs all six steps in order:
+1. `iam/deploy-iam.sh` — IAM role and permissions policy
+2. `lambda/deploy-lambda.sh` — Lambda function
+3. `eventbridge/deploy-eventbridge.sh` — 5-minute schedule
+4. `sns/deploy-sns.sh` — SNS topic, KMS key, subscriptions
+5. `cloudwatch/deploy-alarm.sh` — CloudWatch alarm
+6. `cloudwatch/deploy-dashboard.sh` + `set-log-retention.sh`
+
+Each script can also be run independently.
+
+---
+
+## Database Setup
+
+Run `sql/pgaudit-setup.sql` against the Aurora cluster as the `postgres` superuser.
+
+**Before running the SQL:**
+1. Add `pgaudit` to `shared_preload_libraries` in the cluster parameter group
+2. Reboot the cluster (required for `shared_preload_libraries` changes)
+
+**Critical:** `shared_preload_libraries` loads the binary into shared memory. `CREATE EXTENSION pgaudit` registers it in the database catalog. Both are required — missing the extension install produces zero audit records and zero error messages. The cluster appears healthy but logs nothing.
+
+Diagnostic if logs are empty after setup:
 ```sql
--- Install the extension (required — shared_preload_libraries alone is not enough)
-CREATE EXTENSION pgaudit;
+SELECT * FROM pg_extension WHERE extname = 'pgaudit';
+-- Must return a row. 0 rows = extension not installed.
+```
 
--- Enable per-user audit logging for each individual human user
-ALTER USER <username> SET pgaudit.log TO 'all';
+Enable per-user auditing for each individual human user:
+```sql
+ALTER USER your_username SET pgaudit.log TO 'all';
 
 -- Verify
-SELECT usename, useconfig FROM pg_user WHERE usename = '<username>';
+SELECT usename, useconfig FROM pg_user WHERE usename = 'your_username';
+-- useconfig should show: {pgaudit.log=all}
 ```
 
-> **Critical:** `shared_preload_libraries` loads the binary. `CREATE EXTENSION` registers it. Both are required. Missing the extension install produces zero audit records and zero error messages.
-
-### Step 2: Enable CloudWatch log export
-
-RDS Console → your cluster → Modify → Additional configuration → Log exports → enable **PostgreSQL log**.
-
-Logs flow to: `/aws/rds/cluster/<cluster-name>/postgresql`
-
-### Step 3: Deploy Lambda
-
-```bash
-cd lambda/
-zip audit_monitor.zip lambda_function.py
-
-# Set environment variable for your cluster's log group
-export LOG_GROUP=/aws/rds/cluster/YOUR-CLUSTER/postgresql
-export ACCOUNT_ID=YOUR_ACCOUNT_ID
-export REGION=us-east-1
-
-# See iam/ for role creation
-# See eventbridge/ for schedule setup
-```
-
-> Full CLI deployment: see individual scripts in `iam/`, `eventbridge/`, `cloudwatch/`  
-> Terraform deployment: see `terraform/` (coming)
-
-### Step 4: Configure SNS topic
-
-The SNS topic requires:
-1. Resource policy enforcing HTTPS-only delivery (`DenyInsecureTransport`)
-2. Source account restriction to block cross-account publishing
-3. Customer-managed KMS key for encryption at rest
-
-> **KMS gotcha:** You cannot use `alias/aws/sns` (AWS-managed key) with CloudWatch Alarms. AWS managed key policies are immutable — CloudWatch cannot be granted `kms:GenerateDataKey`. Use a customer-managed key with an explicit CloudWatch service grant. See `docs/kms-gotcha.md`.
-
-### Step 5: Handle incident platform deduplication
-
-Most incident platforms (Opsgenie, PagerDuty, VictorOps) deduplicate alerts by alarm name. The first alert fires; subsequent ones are suppressed if the incident is still open.
-
-Fix options:
-- Timestamp the alarm name at deploy time (`$(date +%s)` suffix)
-- Configure auto-close when alarm returns to OK state
-- Override the alias template in the integration config
-
-> Detail: see `docs/deduplication.md`
+See `sql/pgaudit-setup.sql` for the full script including verification queries.
 
 ---
 
-## The Log Insights Filter Query
+## Lambda Configuration
 
-The core signal filter. Targets user DML on application tables, excluding system catalog queries and tool initialization noise:
+`lambda/lambda_function.py` is driven entirely by environment variables — the same package deploys across all environments without code changes.
 
-```
-fields @timestamp, @message, @logStream, @log
-| filter @message like /AUDIT:/
-| filter (
-    @message like /SELECT/ or
-    @message like /INSERT/ or
-    @message like /UPDATE/ or
-    @message like /DELETE/
-  )
-| filter @message not like /SELECT version()/
-| filter @message not like /pg_shdescription/
-| filter @message not like /pg_database/
-| filter @message not like /pg_catalog/
-| filter @message not like /information_schema/
-| filter @message not like /SET application_name/
-| filter @message not like /SHOW search_path/
-| filter @message not like /SELECT current_schema/
-| filter @message not like /DBeaver/
-| filter @message not like /PostgreSQL JDBC Driver/
-| filter @message not like /datname = \$1/
-| sort @timestamp desc
-```
+| Environment Variable | Default | Description |
+|---|---|---|
+| `LOG_GROUP_NAME` | `/aws/rds/cluster/your-aurora-cluster/postgresql` | CloudWatch log group for the cluster |
+| `METRIC_NAMESPACE` | `RDSAudit/UserActivity` | Custom metric namespace |
+| `QUERY_WINDOW_MINUTES` | `5` | Log Insights look-back window (should match EventBridge schedule) |
 
-Your exclusion list will grow. Every application stack generates its own connection initialization patterns — add them as you observe them in your environment.
+The Lambda publishes two metrics to `RDSAudit/UserActivity`:
+- `UserDMLOperationCount` — count of filtered user DML operations per 5-minute window
+- `MonitorExecutionErrors` — increments if the Lambda itself errors, so the monitor's health is observable
+
+Lambda timeout must be set to **300 seconds**. Log Insights queries are async and can be slow on large log groups.
 
 ---
 
-## Operational Notes
+## SNS Security — Key Points
 
-### pgAudit overhead
+**`sns/topic-policy.json`** applies three statements:
+- `AllowCloudWatchAlarms` — permits CloudWatch to publish, scoped to this account only via `aws:SourceAccount`
+- `DenyInsecureTransport` — explicitly denies HTTP delivery; enforces HTTPS at the policy level
+- `LimitToAccountOnly` — blocks cross-account publishing; prevents confused deputy attacks
 
-Overhead is minimal when audit scope is limited to individual human users. Human users in a regulated production environment are not expected to generate high transaction volumes — the audit target is ad-hoc access, not application traffic. Log volume at this scope is low and adds negligible performance impact.
+**`sns/kms-key-policy.json`** — the `AllowCloudWatchAlarmsToUseKey` statement is critical.
 
-For high-volume clusters: size the instance with audit overhead in mind, and set CloudWatch log retention to match your compliance window rather than keeping logs indefinitely.
+The AWS-managed key `alias/aws/sns` **cannot** be used with CloudWatch Alarms. AWS managed key policies are immutable — you cannot grant CloudWatch `kms:GenerateDataKey`. The symptom is:
 
-### Log Insights query behavior
-
-Log Insights queries are asynchronous. The Lambda polls for completion with a 60-second timeout and a 300-second function timeout. On very high log volumes, initial query runs may be slower — this is a one-time warm-up effect as CloudWatch indexes the log group.
-
-Lambda runs on a 5-minute EventBridge schedule. Concurrency is inherently low — one invocation per cluster per 5 minutes. No concurrency concerns at this scale.
-
-### CloudWatch log retention
-
-Set explicitly. Default is indefinite retention, which accumulates cost. Retention window should be defined by your compliance requirements (90 days, 1 year, 7 years). Apply via:
-
-```bash
-aws logs put-retention-policy \
-  --log-group-name /aws/rds/cluster/YOUR-CLUSTER/postgresql \
-  --retention-in-days 365
 ```
+CloudWatch Alarms does not have authorization to access the SNS topic encryption key
+```
+
+The customer-managed key in this repo has an explicit CloudWatch service grant that resolves this. Note: the `alias/aws/sns` managed key works fine when Lambda publishes directly to SNS — the restriction is specific to the **CloudWatch Alarms → SNS** delivery path.
 
 ---
 
-## Why This Approach Over Alternatives
+## The Noise Filter
 
-**Database Activity Streams (DAS):** DAS provides near-real-time activity streaming to Kinesis but requires additional infrastructure (Kinesis consumer, decryption layer) and adds cost per event. pgAudit + CloudWatch uses infrastructure most AWS teams already operate. For teams without a dedicated Kinesis pipeline, DAS adds meaningful operational surface area for a problem pgAudit already solves natively.
+The Log Insights query in `lambda/lambda_function.py` (also available standalone in `cloudwatch/log-insights-query.txt`) was built incrementally from observed production traffic.
 
-**GuardDuty RDS Protection:** Focused on threat detection (credential anomalies, known malicious IPs), not structured audit trails. Complementary, not equivalent.
+Every database client tool (DBeaver, DataGrip, pgAdmin) fires a sequence of catalog queries on connect. Every JDBC driver runs initialization SELECTs. Every connection pool runs health checks. Without the exclusion filters, the alarm fires constantly on noise with no audit value — and alert fatigue makes the system worthless.
 
-**OpenSearch subscription filters:** Introduces an OpenSearch cluster as a dependency — additional cost, additional operational surface. The CloudWatch + Lambda approach keeps the audit pipeline within services the cluster already depends on.
+The exclusion list covers the most common patterns. Add exclusions specific to your application stack as you identify them.
 
-The guiding principle: use the native, portable solution first. pgAudit is part of PostgreSQL. CloudWatch is where Aurora logs land regardless. Lambda and SNS are general-purpose. No proprietary tooling, no steep learning curve for teams with standard AWS operational knowledge.
+---
+
+## Incident Platform Deduplication
+
+Most incident platforms (Opsgenie, PagerDuty, VictorOps) deduplicate by alarm name. If an alert with the same name is already open, subsequent triggers are suppressed.
+
+`cloudwatch/deploy-alarm.sh` appends a Unix timestamp to the alarm name at deploy time (`rds-user-dml-detected-<epoch>`), generating a unique identifier per deployment.
+
+For ongoing deduplication within a single alarm deployment, configure auto-close in the incident platform integration: when the CloudWatch alarm returns to OK state, the platform closes the incident, and the next ALARM transition creates a fresh one.
 
 ---
 
@@ -248,16 +242,14 @@ The guiding principle: use the native, portable solution first. pgAudit is part 
 
 1. Acknowledge the alert in the incident platform
 2. Open CloudWatch → Log Insights → select the cluster log group
-3. Run the user DML filter query for a ±15 minute window around the alert timestamp
-4. Parse the audit record format:
+3. Run the query from `cloudwatch/log-insights-query.txt` for a ±15 minute window around the alert timestamp
+4. Parse the audit record to identify user, operation, and object:
    ```
    AUDIT: SESSION,<session_id>,<statement_id>,<class>,<command>,<object_type>,<object_name>,<statement>
    ```
-5. Determine if the activity was expected (scheduled job, deployment, authorized access)
-6. If unexpected: escalate to application team and security team; examine correlated events in the same window
+5. Determine if the activity was expected (scheduled job, deployment, authorised access)
+6. If unexpected: escalate to the application team and security team; check for correlated events in the same window
 7. Document the finding and close or escalate the incident ticket
-
-> Full runbook: see `docs/alert-runbook.md`
 
 ---
 
@@ -266,26 +258,36 @@ The guiding principle: use the native, portable solution first. pgAudit is part 
 Per Aurora cluster per month (us-east-1):
 
 | Component | Monthly Cost |
-|-----------|-------------|
+|---|---|
 | Lambda — 8,640 invocations (5-min schedule) | ~$0.09 |
 | CloudWatch Log Insights queries | ~$2.50 |
 | CloudWatch custom metric | ~$0.30 |
 | CloudWatch alarm | ~$0.10 |
 | SNS notifications | ~$0.01 |
 | Customer-managed KMS key | ~$1.00 |
-| **Total** | **~$3.00–$4.00/month per cluster** |
-
-The full stack fits in a parameterized Terraform module — cluster name, account ID, log group, and notification endpoint as variables. Deploying to additional accounts is a single `terraform apply`.
+| **Total** | **~$3.00–$4.00 / cluster / month** |
 
 ---
 
-## Related Articles
+## Operational Notes
 
-- [Dev.to: What It Actually Takes to Audit Aurora PostgreSQL on AWS](#) *(link when published)*
-- [Medium: Rebuilding Oracle-Style Database Auditing on Aurora PostgreSQL](#) *(link when published)*
+**Log volume:** Minimal at this audit scope. Individual human users in a regulated environment are not expected to generate high transaction volumes — the audit target is ad-hoc access, not application traffic.
+
+**Log retention:** Set via `cloudwatch/set-log-retention.sh` or the `log_retention_days` Terraform variable. Default is 365 days. Set to match your compliance requirement. CloudWatch default is indefinite retention if not explicitly configured.
+
+**Lambda concurrency:** One invocation per cluster per 5 minutes. No concurrency concerns at this scale.
+
+**Alarm initialisation:** The alarm shows `INSUFFICIENT_DATA` until the Lambda publishes its first metric data point. Invoke manually to initialise:
+```bash
+aws lambda invoke \
+  --function-name rds-user-audit-monitor \
+  --payload '{}' \
+  response.json && cat response.json
+```
 
 ---
 
-## License
+## Related
 
-MIT
+- Dev.to article: *What It Actually Takes to Audit Aurora PostgreSQL on AWS*
+- Medium article: *Rebuilding Oracle-Style Database Auditing on Aurora PostgreSQL*
