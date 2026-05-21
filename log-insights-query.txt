@@ -1,0 +1,29 @@
+# Aurora PostgreSQL User DML Audit Filter Query
+# Use this directly in the CloudWatch Log Insights console.
+# Replace the SOURCE log group name with your cluster's log group.
+#
+# This query filters the raw pgAudit log stream to individual-user
+# DML operations only, excluding system catalog queries and tool noise.
+# The exclusion list was built from observed production traffic.
+# Add patterns specific to your application stack as needed.
+
+fields @timestamp, @message, @logStream, @log
+| filter @message like /AUDIT:/
+| filter (
+    @message like /SELECT/ or
+    @message like /INSERT/ or
+    @message like /UPDATE/ or
+    @message like /DELETE/
+  )
+| filter @message not like /SELECT version()/
+| filter @message not like /pg_shdescription/
+| filter @message not like /pg_database/
+| filter @message not like /pg_catalog/
+| filter @message not like /information_schema/
+| filter @message not like /SET application_name/
+| filter @message not like /SHOW search_path/
+| filter @message not like /SELECT current_schema/
+| filter @message not like /DBeaver/
+| filter @message not like /PostgreSQL JDBC Driver/
+| filter @message not like /datname = \$1/
+| sort @timestamp desc

@@ -1,0 +1,16 @@
+# terraform.tfvars.example
+# Copy to terraform.tfvars and fill in values before deploying.
+# Do NOT commit terraform.tfvars to source control (incident_platform_url is sensitive).
+
+cluster_name          = "your-aurora-cluster-name"
+environment           = "production"
+alert_email           = "engineering-team@your-company.com"
+incident_platform_url = "https://your-incident-platform/endpoint?apiKey=YOUR_KEY"
+query_window_minutes  = 5
+log_retention_days    = 365
+
+tags = {
+  Owner       = "platform-engineering"
+  Project     = "db-audit"
+  ManagedBy   = "terraform"
+}

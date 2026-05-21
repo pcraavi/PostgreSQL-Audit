@@ -1,0 +1,46 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudWatchAlarms",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudwatch.amazonaws.com"
+      },
+      "Action": "SNS:Publish",
+      "Resource": "arn:aws:sns:YOUR_REGION:YOUR_ACCOUNT_ID:rds-user-audit-alerts",
+      "Condition": {
+        "ArnLike": {
+          "aws:SourceArn": "arn:aws:cloudwatch:YOUR_REGION:YOUR_ACCOUNT_ID:alarm:*"
+        },
+        "StringEquals": {
+          "aws:SourceAccount": "YOUR_ACCOUNT_ID"
+        }
+      }
+    },
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "SNS:Publish",
+      "Resource": "arn:aws:sns:YOUR_REGION:YOUR_ACCOUNT_ID:rds-user-audit-alerts",
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "false"
+        }
+      }
+    },
+    {
+      "Sid": "LimitToAccountOnly",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "SNS:Publish",
+      "Resource": "arn:aws:sns:YOUR_REGION:YOUR_ACCOUNT_ID:rds-user-audit-alerts",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:SourceAccount": "YOUR_ACCOUNT_ID"
+        }
+      }
+    }
+  ]
+}
