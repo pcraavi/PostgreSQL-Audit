@@ -289,5 +289,5 @@ aws lambda invoke \
 
 ## Related
 
-- Dev.to article: *What It Actually Takes to Audit Aurora PostgreSQL on AWS*
-- Medium article: *Rebuilding Oracle-Style Database Auditing on Aurora PostgreSQL*
+- Dev.to article: https://dev.to/pranay_raavi/what-it-actually-takes-to-audit-aurora-postgresql-on-aws-l7j
+- Medium article: https://medium.com/@pranayraavi/database-auditing-on-aws-aurora-postgresql-ee758aad3fe3
